@@ -18,12 +18,14 @@ module Jekyll
   module Mephisto
     #Accepts a hash with database config variables, exports mephisto posts into a csv
     #export PGPASSWORD if you must
+    DEFAULT_USER_ID = 1
+
     def self.postgres(c)
       sql = <<-SQL
       BEGIN;
       CREATE TEMP TABLE jekyll AS
         SELECT title, permalink, body, published_at, filter FROM contents
-        WHERE user_id = 1 AND type = 'Article' ORDER BY published_at;
+        WHERE user_id IN (%s) AND type = 'Article' ORDER BY published_at;
       COPY jekyll TO STDOUT WITH CSV HEADER;
       ROLLBACK;
       SQL
@@ -36,16 +38,42 @@ module Jekyll
     # This query will pull blog posts from all entries across all blogs. If
     # you've got unpublished, deleted or otherwise hidden posts please sift
     # through the created posts to make sure nothing is accidently published.
-    QUERY = "SELECT id, \
-                    permalink, \
-                    body, \
-                    published_at, \
-                    title \
-             FROM contents \
-             WHERE user_id = 1 AND \
-                   type = 'Article' AND \
-                   published_at IS NOT NULL \
-             ORDER BY published_at"
+    ARTICLE_QUERY = <<-SQL
+      SELECT id,
+              permalink,
+              body,
+              published_at,
+              title,
+              filter,
+              comments_count
+       FROM contents
+       WHERE user_id = 2 AND
+             type = 'Article' AND
+             published_at IS NOT NULL
+       ORDER BY published_at
+    SQL
+
+    ARTICLE_TAGS_QUERY = <<-SQL
+      SELECT LOWER(tags.name) AS name
+      FROM tags
+      JOIN taggings ON taggings.tag_id = tags.id
+      WHERE taggings.taggable_type = 'Content' AND
+            taggings.taggable_id = %s
+    SQL
+
+    ARTICLE_COMMENTS_QUERY = <<-SQL
+      SELECT title,
+             body,
+             author,
+             author_url,
+             author_email,
+             author_ip,
+             published_at,
+             filter
+      FROM contents
+      WHERE article_id = %s
+      ORDER BY published_at
+    SQL
 
     def self.process(dbname, user, pass, host = 'localhost')
       db = Sequel.mysql(dbname, :user => user,
@@ -55,21 +83,38 @@ module Jekyll
 
       FileUtils.mkdir_p "_posts"
 
-      db[QUERY].each do |post|
+      db[(ARTICLE_QUERY % (ENV['USER_IDS'] || DEFAULT_USER_ID))].each do |post|
         title = post[:title]
         slug = post[:permalink]
         date = post[:published_at]
         content = post[:body]
 
-        # Ideally, this script would determine the post format (markdown,
-        # html, etc) and create files with proper extensions. At this point
-        # it just assumes that markdown will be acceptable.
-        name = [date.year, date.month, date.day, slug].join('-') + ".markdown"
+        comments = []
+        db[(ARTICLE_COMMENTS_QUERY % post[:id])].each do |comment|
+          comments << {
+            title: comment[:title],
+            body: comment[:body].to_s,
+            name: comment[:author],
+            email: comment[:author_email],
+            ip: comment[:author_ip],
+            published_at: comment[:published_at],
+          }
+        end
+
+        tags = []
+        db[(ARTICLE_TAGS_QUERY % post[:id])].each do |tag|
+          tags << tag
+        end
+
+        filter = post[:filter].gsub('_filter','').strip
+        name = [date.year, date.day, date.month, slug].join('-') + ".#{filter.size > 0 ? filter : 'html'}"
 
         data = {
+           'mt_id' => post[:id],
            'layout' => 'post',
            'title' => title.to_s,
-           'mt_id' => post[:entry_id],
+           'tags' => tags,
+           'comments' => comments,
          }.delete_if { |k,v| v.nil? || v == ''}.to_yaml
 
         File.open("_posts/#{name}", "w") do |f|
